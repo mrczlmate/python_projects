@@ -20,3 +20,10 @@ This repository includes various Python-based projects, ranging from machine lea
   - `voice-assistant.py`: Simple command-based voice assistant.
 
 ---
+
+### 📁 `stock_projects/`
+- **Focus**: Stock market prediction and analysis.
+- **Tools Used**: Pandas, NumPy, Scikit-learn, Matplotlib.
+- **Goal**: Create data pipelines and models for analyzing or predicting financial data.
+
+---
