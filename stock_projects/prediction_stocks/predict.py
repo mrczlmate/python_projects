@@ -1,88 +1,196 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import yfinance as yf
 import datetime as dt
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Attention, Concatenate
+import optuna
+from finta import TA
+
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
-import optuna
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, GRU, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tqdm.keras import TqdmCallback
+from tensorflow.keras import backend as K
 
 # -------------------------------
+# Feature engineering with finta indicators
+
 def add_indicators(df):
-    df['MA50'] = df['Close'].rolling(window=50).mean()
-    df['MA200'] = df['Close'].rolling(window=200).mean()
-    df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA12'] - df['EMA26']
-    delta = df['Close'].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
-    rs = ema_up / ema_down
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df = df.dropna()
+    df = df.copy()
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+    df['SMA_50'] = TA.SMA(df, 50)
+    df['SMA_200'] = TA.SMA(df, 200)
+    df['EMA_12'] = TA.EMA(df, 12)
+    df['EMA_26'] = TA.EMA(df, 26)
+    df['MACD'] = TA.MACD(df)['MACD']
+    df['RSI'] = TA.RSI(df)
+
+    bb = TA.BBANDS(df)
+    df['BBU'] = bb['BB_UPPER']
+    df['BBL'] = bb['BB_LOWER']
+
+    df['ATR'] = TA.ATR(df)
+
+    columns_required = ['Close', 'SMA_50', 'SMA_200', 'Volume', 'MACD', 'RSI', 'BBU', 'BBL', 'ATR']
+    df = df.dropna(subset=columns_required)
+
+    if df.empty:
+        raise ValueError("No valid rows remaining after applying indicators.")
+
     return df
 
 # -------------------------------
-def build_attention_lstm_model(input_shape, units, dropout, learning_rate):
+# Model building - Optuna version
+
+def build_gru_model(input_shape, gru_units, dense_units, dropout_rate):
     inputs = Input(shape=input_shape)
-    lstm_out = LSTM(units, return_sequences=True)(inputs)
-    lstm_out = Dropout(dropout)(lstm_out)
-    attention = Attention()([lstm_out, lstm_out])
-    concat = Concatenate()([lstm_out, attention])
-    lstm_out_2 = LSTM(units)(concat)
-    dropout_2 = Dropout(dropout)(lstm_out_2)
-    output = Dense(1)(dropout_2)
+    gru_out = GRU(gru_units, return_sequences=False)(inputs)
+    dropout = Dropout(dropout_rate)(gru_out)
+    dense = Dense(dense_units, activation='relu')(dropout)
+    output = Dense(1)(dense)
     model = Model(inputs, output)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss='mean_squared_error')
+    model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
 # -------------------------------
-def prepare_data(df, prediction_days):
-    features = df[['Close', 'MA50', 'MA200', 'Volume', 'MACD', 'RSI']].values
-    scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(features)
-    x_data, y_data = [], []
-    for x in range(prediction_days, len(scaled_data)):
-        x_data.append(scaled_data[x - prediction_days:x, :])
-        y_data.append(scaled_data[x, 0])
-    return np.array(x_data), np.array(y_data), scaler
+# Data download and preprocessing
+
+company = '^GSPC'
+start = dt.datetime(2010, 1, 1)
+end = dt.datetime(2020, 1, 1)
+
+data = yf.download(company, start, end)
+if isinstance(data.columns, pd.MultiIndex):
+    data.columns = data.columns.get_level_values(0)
+data = add_indicators(data)
+
+features_used = ['Close', 'SMA_50', 'SMA_200', 'Volume', 'MACD', 'RSI', 'BBU', 'BBL', 'ATR']
+features = data[features_used].values
+
+feature_scaler = MinMaxScaler()
+scaled_data = feature_scaler.fit_transform(features)
+
+close_scaler = MinMaxScaler()
+scaled_close = close_scaler.fit_transform(data[['Close']].values)
+
+prediction_days = 100
+x, y = [], []
+
+for i in range(prediction_days, len(scaled_data)):
+    x.append(scaled_data[i - prediction_days:i, :])
+    y.append(scaled_close[i, 0])
+
+x, y = np.array(x), np.array(y)
 
 # -------------------------------
+# Optuna objective function
+
 def objective(trial):
-    # Hyperparams
-    units = trial.suggest_int('units', 64, 256)
-    dropout = trial.suggest_float('dropout', 0.2, 0.5)
-    learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64, 128])
-    prediction_days = trial.suggest_int('prediction_days', 50, 200)
+    gru_units = trial.suggest_int("gru_units", 32, 128)
+    dense_units = trial.suggest_int("dense_units", 32, 128)
+    dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.5)
 
-    # Data preparation
-    data = yf.download('^GSPC', '2012-01-01', '2020-01-01')
-    data = add_indicators(data)
-    x_train, y_train, scaler = prepare_data(data, prediction_days)
+    split_index = int(len(x) * 0.9)
+    x_train, x_val = x[:split_index], x[split_index:]
+    y_train, y_val = y[:split_index], y[split_index:]
 
-    # Model
-    model = build_attention_lstm_model((x_train.shape[1], x_train.shape[2]), units, dropout, learning_rate)
-    
-    # Train
-    history = model.fit(x_train, y_train, epochs=25, batch_size=batch_size, verbose=0)
+    model = build_gru_model((x.shape[1], x.shape[2]), gru_units, dense_units, dropout_rate)
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-    # Evaluate on train set itself (mivel csak train van, de ez elegendő az összehasonlításhoz)
-    pred = model.predict(x_train)
-    pred_prices = scaler.inverse_transform(np.concatenate((pred, np.zeros((pred.shape[0], x_train.shape[2] - 1))), axis=1))[:, 0]
-    real_prices = scaler.inverse_transform(np.concatenate((y_train.reshape(-1, 1), np.zeros((y_train.shape[0], x_train.shape[2] - 1))), axis=1))[:, 0]
+    model.fit(x_train, y_train, epochs=50, batch_size=32, verbose=0,
+              validation_data=(x_val, y_val), shuffle=False, callbacks=[early_stop])
 
-    rmse = np.sqrt(mean_squared_error(real_prices, pred_prices))
-    return rmse
+    val_pred = model.predict(x_val)
+    val_rmse = np.sqrt(mean_squared_error(y_val, val_pred))
+
+    print(f"Trial {trial.number}: RMSE={val_rmse:.6f}, params={{'gru_units': {gru_units}, 'dense_units': {dense_units}, 'dropout_rate': {dropout_rate:.3f}}}")
+
+    K.clear_session()
+    return val_rmse
+
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=20, show_progress_bar=True)
+best_params = study.best_params
 
 # -------------------------------
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=20)
+# Train new model with best hyperparameters
 
-print("\nBest hyperparameters:")
-print(study.best_params)
-print(f"Best RMSE: {study.best_value}")
+model = build_gru_model((x.shape[1], x.shape[2]),
+                        best_params['gru_units'],
+                        best_params['dense_units'],
+                        best_params['dropout_rate'])
+
+early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+split_index = int(len(x) * 0.9)
+x_train, x_val = x[:split_index], x[split_index:]
+y_train, y_val = y[:split_index], y[split_index:]
+
+model.fit(x_train, y_train, epochs=100, batch_size=32, verbose=0,
+          validation_data=(x_val, y_val), shuffle=False, callbacks=[early_stop, TqdmCallback(verbose=1)])
+
+# -------------------------------
+# Test data preparation
+
+test_start = dt.datetime(2020, 1, 1)
+test_end = dt.datetime.now()
+
+test_data = yf.download(company, test_start, test_end)
+if isinstance(test_data.columns, pd.MultiIndex):
+    test_data.columns = test_data.columns.get_level_values(0)
+test_data = add_indicators(test_data)
+actual_prices = test_data['Close'].values
+
+total_data = pd.concat((data, test_data), axis=0)
+recent_data = total_data.loc[test_data.index[0] - pd.Timedelta(days=prediction_days):]
+model_inputs = recent_data[features_used].values
+model_inputs = feature_scaler.transform(model_inputs)
+
+x_test = []
+for i in range(prediction_days, len(model_inputs)):
+    x_test.append(model_inputs[i - prediction_days:i, :])
+x_test = np.array(x_test)
+
+# -------------------------------
+# Prediction and inverse scaling
+
+predicted_scaled = model.predict(x_test)
+predicted_prices = close_scaler.inverse_transform(predicted_scaled)[:, 0]
+
+rmse = np.sqrt(mean_squared_error(actual_prices[-len(predicted_prices):], predicted_prices))
+print(f"RMSE on test data: {rmse:.2f}")
+
+# -------------------------------
+# Visualization
+
+plt.figure(figsize=(14,6))
+plt.plot(actual_prices, color='black', label='Actual Price')
+plt.plot(predicted_prices, color='green', label='Predicted Price (Optimized GRU)')
+plt.title(f'{company} Share Price - Optimized GRU Model')
+plt.xlabel('Time')
+plt.ylabel('Price')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# Error distribution
+
+errors = actual_prices[-len(predicted_prices):] - predicted_prices
+plt.figure()
+plt.hist(errors, bins=50, color='gray')
+plt.title("Prediction Error Histogram")
+plt.xlabel("Error")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# MAPE (relative error)
+
+mape = np.mean(np.abs(errors / actual_prices[-len(predicted_prices):])) * 100
+print(f"MAPE on test data: {mape:.2f}%")
